@@ -694,7 +694,7 @@
       await initDB();
       const stationCount = await dbOp('stations', 'readonly', s => s.count());
       if (stationCount === 0) {
-        for (const s of INITIAL_STATIONS) await dbOp('stations', 'readwrite', s => s.add(s));
+        for (const s of INITIAL_STATIONS) await dbOp('stations', 'readwrite', store => store.add(s));
         for (const i of INITIAL_ITEMS) await dbOp('master', 'readwrite', s => s.add(i));
       }
       renderHomeScreen();
