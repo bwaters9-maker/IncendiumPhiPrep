@@ -35,7 +35,8 @@
   <style>
     body { background-color: #0f1117; color: #e2e8f0; -webkit-tap-highlight-color: transparent; }
     input[type="number"]::-webkit-inner-spin-button, input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
-    
+    .att-scroll { max-height: 16rem; overflow-y: auto; }
+
     #print-section { display: none; }
     @media print {
       body * { visibility: hidden; }
@@ -644,10 +645,26 @@
     </div>
   </div>
 
+  <!-- ATTACHMENTS MODAL -->
+  <div id="modal-attachments" class="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4 hidden">
+    <div class="bg-[#141720] border border-[#2a2d38] rounded-2xl w-full max-w-xs p-6 shadow-2xl relative">
+      <button onclick="closeAttachmentModal()" class="absolute right-4 top-4 text-slate-400">✕</button>
+      <h3 id="attachment-modal-title" class="text-lg font-bold text-slate-100 mb-2">Attachments</h3>
+      <p class="text-xs text-slate-500 mb-4">Photos or spec sheets for this item. Stored on this device only.</p>
+      <div id="attachment-list" class="att-scroll space-y-3 mb-4"></div>
+      <label style="display:block" class="w-full py-3 bg-amber-500 text-slate-950 font-bold rounded-xl text-sm text-center cursor-pointer">
+        + Add Attachment
+        <input type="file" accept="image/*,application/pdf" multiple onchange="handleAttachmentFileSelected(event)" class="hidden">
+      </label>
+    </div>
+  </div>
+
   <script>
     const DB_NAME = 'MiseOS_Full_DB';
-    const DB_VERSION = 2;
+    const DB_VERSION = 3;
     let db;
+    const MAX_ATTACHMENT_MB = 10;
+    const MAX_ATTACHMENT_BYTES = MAX_ATTACHMENT_MB * 1024 * 1024;
 
     const initDB = () => {
       return new Promise((resolve, reject) => {
@@ -656,9 +673,21 @@
         request.onsuccess = () => { db = request.result; resolve(); };
         request.onupgradeneeded = (e) => {
           const db = e.target.result;
-          db.createObjectStore('stations', { keyPath: 'id' }); // {id, name, icon}
-          db.createObjectStore('master', { keyPath: 'id' });    // {id, stationId, component, unit}
-          db.createObjectStore('state', { keyPath: 'id' });     // {id, checked, amount, skipped}
+          // Guarded with contains() checks so upgrading an existing database
+          // (adding a store in a later version) doesn't re-create — and throw on — stores that already exist.
+          if (!db.objectStoreNames.contains('stations')) {
+            db.createObjectStore('stations', { keyPath: 'id' }); // {id, name, icon}
+          }
+          if (!db.objectStoreNames.contains('master')) {
+            db.createObjectStore('master', { keyPath: 'id' });    // {id, stationId, component, unit}
+          }
+          if (!db.objectStoreNames.contains('state')) {
+            db.createObjectStore('state', { keyPath: 'id' });     // {id, checked, amount, skipped}
+          }
+          if (!db.objectStoreNames.contains('attachments')) {
+            const attachmentsStore = db.createObjectStore('attachments', { keyPath: 'id' }); // {id, itemId, name, type, size, blob, addedAt}
+            attachmentsStore.createIndex('itemId', 'itemId', { unique: false });
+          }
         };
       });
     };
@@ -766,6 +795,7 @@
 
       for (const item of stationItems) {
         const state = await dbOp('state', 'readonly', store => store.get(item.id)) || { checked: false, amount: '', skipped: false };
+        const attCount = (await dbOp('attachments', 'readonly', store => store.index('itemId').getAll(item.id))).length;
         list.innerHTML += `
           <div class="flex items-center justify-between p-4 rounded-2xl border ${state.skipped ? 'bg-slate-900/50 border-slate-800 opacity-50' : state.checked ? 'bg-emerald-900/20 border-emerald-500/30' : 'bg-[#141720] border-[#262a38]'}">
             <div class="flex items-center gap-3">
@@ -779,6 +809,7 @@
             </div>
             <div class="flex items-center gap-2">
               <input type="number" onchange="updateAmount('${item.id}', this.value)" value="${state.amount}" placeholder="0" class="w-16 px-2 py-1 bg-[#181b26] border border-[#2e3240] rounded-lg text-sm font-mono text-amber-400 outline-none text-center">
+              <button onclick="openAttachmentModal('${item.id}')" class="p-2 text-xs text-slate-500 hover:text-white">📎${attCount ? `<span class="text-amber-400 font-mono">${attCount}</span>` : ''}</button>
               <button onclick="toggleSkip('${item.id}')" class="p-2 text-xs text-slate-500 hover:text-white">${state.skipped ? 'Undo' : 'Skip'}</button>
             </div>
           </div>
@@ -858,7 +889,12 @@
       if(confirm('Delete station and all its items?')) {
         await dbOp('stations', 'readwrite', s => s.delete(id));
         const items = await dbOp('master', 'readonly', s => s.getAll());
-        for(const i of items) { if(i.stationId === id) await dbOp('master', 'readwrite', s => s.delete(i.id)); }
+        for(const i of items) {
+          if(i.stationId === id) {
+            await dbOp('master', 'readwrite', s => s.delete(i.id));
+            await deleteAttachmentsForItem(i.id);
+          }
+        }
         renderAdminScreen();
       }
     }
@@ -871,14 +907,18 @@
       document.getElementById('admin-item-count').innerText = `${filtered.length} Items`;
       const body = document.getElementById('admin-items-table-body');
       body.innerHTML = '';
-      filtered.forEach(item => {
+      for (const item of filtered) {
+        const attCount = (await dbOp('attachments', 'readonly', store => store.index('itemId').getAll(item.id))).length;
         body.innerHTML += `
           <div class="p-4 flex justify-between items-center hover:bg-[#181b26]">
             <div class="text-sm font-bold text-slate-200">${item.component} <span class="text-[10px] text-slate-500 font-mono ml-2">${item.unit}</span></div>
-            <button onclick="deleteItem('${item.id}')" class="text-xs text-red-400 hover:underline">Delete</button>
+            <div class="flex items-center gap-3">
+              <button onclick="openAttachmentModal('${item.id}')" class="text-xs text-slate-400 hover:text-amber-400">📎${attCount ? ` ${attCount}` : ''}</button>
+              <button onclick="deleteItem('${item.id}')" class="text-xs text-red-400 hover:underline">Delete</button>
+            </div>
           </div>
         `;
-      });
+      }
     }
 
     async function handleAdminAddItem(e) {
@@ -896,8 +936,101 @@
       if (confirm('Delete this item?')) {
         await dbOp('master', 'readwrite', s => s.delete(id));
         await dbOp('state', 'readwrite', s => s.delete(id));
+        await deleteAttachmentsForItem(id);
         renderAdminItems();
       }
+    }
+
+    // ATTACHMENT FUNCTIONS
+    let attachmentModalItemId = null;
+    let attachmentObjectUrls = [];
+
+    function revokeAttachmentObjectUrls() {
+      attachmentObjectUrls.forEach(u => URL.revokeObjectURL(u));
+      attachmentObjectUrls = [];
+    }
+
+    async function deleteAttachmentsForItem(itemId) {
+      const atts = await dbOp('attachments', 'readonly', s => s.index('itemId').getAll(itemId));
+      for (const att of atts) await dbOp('attachments', 'readwrite', s => s.delete(att.id));
+    }
+
+    async function openAttachmentModal(itemId) {
+      attachmentModalItemId = itemId;
+      const item = await dbOp('master', 'readonly', s => s.get(itemId));
+      document.getElementById('attachment-modal-title').innerText = item ? item.component : 'Attachments';
+      document.getElementById('modal-attachments').classList.remove('hidden');
+      await renderAttachmentList();
+    }
+
+    function closeAttachmentModal() {
+      revokeAttachmentObjectUrls();
+      document.getElementById('modal-attachments').classList.add('hidden');
+      attachmentModalItemId = null;
+    }
+
+    async function renderAttachmentList() {
+      if (!attachmentModalItemId) return;
+      revokeAttachmentObjectUrls();
+      const atts = await dbOp('attachments', 'readonly', s => s.index('itemId').getAll(attachmentModalItemId));
+      const wrap = document.getElementById('attachment-list');
+      if (atts.length === 0) {
+        wrap.innerHTML = '<p class="text-xs text-slate-500 text-center p-4">No attachments yet.</p>';
+        return;
+      }
+      wrap.innerHTML = '';
+      atts.forEach(att => {
+        const url = URL.createObjectURL(att.blob);
+        attachmentObjectUrls.push(url);
+        const isImage = (att.type || '').startsWith('image/');
+        wrap.innerHTML += `
+          <div class="flex items-center justify-between gap-3 p-2 bg-[#181b26] border border-[#2e3240] rounded-xl">
+            <a href="${url}" target="_blank" rel="noopener" style="min-width:0" class="flex items-center gap-3 flex-1">
+              ${isImage
+                ? `<img src="${url}" style="height:3rem;object-fit:cover" class="w-12 rounded-lg border border-[#2e3240]">`
+                : `<div style="height:3rem" class="w-12 flex items-center justify-center rounded-lg border border-[#2e3240] bg-[#141720] text-xl">📄</div>`}
+              <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" class="text-xs text-slate-300">${att.name}</span>
+            </a>
+            <button onclick="deleteAttachment('${att.id}')" style="flex-shrink:0" class="text-xs text-red-400 hover:underline">Remove</button>
+          </div>
+        `;
+      });
+    }
+
+    async function handleAttachmentFileSelected(e) {
+      const files = Array.from(e.target.files || []);
+      for (const file of files) {
+        if (file.size > MAX_ATTACHMENT_BYTES) {
+          alert(`"${file.name}" is over the ${MAX_ATTACHMENT_MB}MB limit and was skipped.`);
+          continue;
+        }
+        const record = {
+          id: 'att_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8),
+          itemId: attachmentModalItemId,
+          name: file.name,
+          type: file.type,
+          size: file.size,
+          blob: file,
+          addedAt: Date.now()
+        };
+        await dbOp('attachments', 'readwrite', s => s.add(record));
+      }
+      e.target.value = '';
+      await renderAttachmentList();
+      await refreshAttachmentBadges();
+    }
+
+    async function deleteAttachment(attachmentId) {
+      if (confirm('Remove this attachment?')) {
+        await dbOp('attachments', 'readwrite', s => s.delete(attachmentId));
+        await renderAttachmentList();
+        await refreshAttachmentBadges();
+      }
+    }
+
+    async function refreshAttachmentBadges() {
+      if (!document.getElementById('screen-detail').classList.contains('hidden')) renderStationDetail();
+      if (!document.getElementById('screen-admin').classList.contains('hidden')) renderAdminItems();
     }
 
     async function prepareAndPrint(target) {
